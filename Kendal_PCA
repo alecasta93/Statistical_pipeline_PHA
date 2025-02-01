@@ -1,0 +1,253 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import shapiro
+from mpl_toolkits.mplot3d import Axes3D
+from google.colab import files
+import numpy as np
+
+def analyze_and_plot(file_path):
+    data = pd.read_csv(file_path, delimiter=';')
+
+    # ========================
+    # 1) Shapiro-Wilk test
+    # ========================
+    shapiro_results = {}
+    non_normal_variables = []
+    for column in data.select_dtypes(include=['float64', 'int64']).columns:
+        stat, p_value = shapiro(data[column].dropna())
+        shapiro_results[column] = {'statistic': stat, 'p_value': p_value}
+        if p_value < 0.05:
+            non_normal_variables.append(column)
+
+    # Creiamo un DataFrame con i p-value del test di Shapiro
+    shapiro_df = pd.DataFrame(
+        {
+            'Variable': list(shapiro_results.keys()),
+            'Shapiro p-value': [val['p_value'] for val in shapiro_results.values()]
+        }
+    )
+
+    # ========================
+    # 2) Outlier detection
+    # ========================
+    for column in data.select_dtypes(include=['float64', 'int64']).columns:
+        Q1 = data[column].quantile(0.25)
+        Q3 = data[column].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        outliers = ((data[column] < lower_bound) | (data[column] > upper_bound))
+        data.loc[outliers, column] = data[column].median()
+
+    # ========================
+    # 3) Correlazione Kendall
+    # ========================
+    kendall_correlation = data.corr(method='kendall')
+
+    # ========================
+    # 4) Label map (LaTeX)
+    # ========================
+    label_map = {
+        'T_amb': r'T$_{amb}$',
+        'T_bio': r'T$_{bio}$',
+        '∂H+': r'$\Delta H^{+}$',
+        'pH_max': r'pH$_{max}$',
+        'pH_min': r'pH$_{min}$'
+    }
+    data.columns = [label_map.get(col, col) for col in data.columns]
+    kendall_correlation.columns = [label_map.get(col, col) for col in kendall_correlation.columns]
+    kendall_correlation.index = [label_map.get(col, col) for col in kendall_correlation.index]
+
+    # ========================
+    # 5) PCA
+    # ========================
+    numerical_data = data.select_dtypes(include=['float64', 'int64']).dropna()
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(numerical_data)
+
+    pca = PCA()
+    pca_result = pca.fit_transform(scaled_data)
+    loadings = pca.components_.T
+
+    # Ordiniamo i loadings per grandezza (per selezionare i top 10)
+    loading_magnitudes = (loadings[:, :3]**2).sum(axis=1)**0.5
+    top_indices = loading_magnitudes.argsort()[-10:][::-1]
+
+    # ========================
+    # 6) Crea e stampa la tabella con la varianza spiegata
+    # ========================
+    explained_variance_ratios = pca.explained_variance_ratio_ * 100
+    components = [f'PC{i+1}' for i in range(len(explained_variance_ratios))]
+    explained_variance_df = pd.DataFrame(
+        {
+            'Component': components,
+            'Explained Variance (%)': explained_variance_ratios
+        }
+    )
+
+    # ========================
+    # Stampa delle tabelle
+    # ========================
+    print("=== Shapiro-Wilk Test p-values ===")
+    print(shapiro_df.to_string(index=False))
+    print("\n=== PCA Explained Variance ===")
+    print(explained_variance_df.to_string(index=False))
+
+    # ========================
+    # 7) Figura e grafici
+    # ========================
+    # Imposta la larghezza a 12 e l'altezza a 8
+    fig = plt.figure(figsize=(16, 8))
+
+    # Subplot 1: Heatmap
+    ax1 = fig.add_subplot(121)
+    sns.heatmap(
+        kendall_correlation,
+        annot=True,
+        fmt=".2f",
+        cmap="coolwarm",
+        cbar=True,
+        ax=ax1,
+        annot_kws={"size": 10}  # Font size per i valori dentro le celle
+    )
+
+    # Titolo del subplot (A)
+    ax1.set_title("(A)", loc='left', fontsize=14, fontweight='bold')
+
+    # Adeguamento dei tick
+    ax1.tick_params(axis='both', which='major', labelsize=11)
+
+    # Subplot 2: PCA 3D
+    ax2 = fig.add_subplot(122, projection='3d')
+    pca_columns = [f'PC{i+1}' for i in range(pca.n_components_)]
+    pca_df = pd.DataFrame(pca_result, columns=pca_columns)
+
+    ax2.scatter(
+        pca_df['PC1'],
+        pca_df['PC2'],
+        pca_df['PC3'],
+        c='k',
+        marker='x',
+        alpha=0.7
+    )
+
+    # Titolo del subplot (B)
+    ax2.set_title("(B)", loc='left', fontsize=14, fontweight='bold')
+
+    # Rotazione
+    ax2.view_init(elev=20, azim=60)
+
+    # Limiti assi
+    ax2.set_xlim(-4, 3)
+    ax2.set_ylim(-2, 5)
+    ax2.set_zlim(-4, 3)
+
+    # Funzione per gestire la sovrapposizione etichette (opzionale)
+    def avoid_label_overlap(existing_positions, new_position, threshold=0.4, step=0.2, max_iter=50):
+        new_pos = np.array(new_position, dtype=float)
+        for _ in range(max_iter):
+            too_close = False
+            for pos in existing_positions:
+                dist = np.linalg.norm(new_pos - pos)
+                if dist < threshold:
+                    new_pos += step
+                    too_close = True
+                    break
+            if not too_close:
+                break
+        existing_positions.append(new_pos)
+        return new_pos
+
+    label_positions = []
+    arrow_scale = 5
+
+    # Dizionario per le posizioni manuali (RTSS, PHB/V, N) - se desideri
+    manual_positions = {
+        'TSS': (1.30, 1, 0.6),
+        'PHB/V': (-1.5, -1.1, -1.65),
+        'N': (0.25, 2.1, -0.66)
+    }
+
+    # Lista per salvare la punta delle frecce di TSS, PHB/V, N
+    special_tips = []
+
+    # Variabili da tracciare manualmente
+    special_vars = {'TSS', 'PHB/V', 'N'}
+
+    for i in top_indices:
+        # Coordinate del loading (PC1, PC2, PC3)
+        x, y, z = loadings[i, :3]
+
+        # Calcoliamo la punta della freccia (arrow tip)
+        arrow_tip = (x * arrow_scale, y * arrow_scale, z * arrow_scale)
+
+        # Disegno la freccia
+        ax2.quiver(0, 0, 0, arrow_tip[0], arrow_tip[1], arrow_tip[2],
+                   color='r', arrow_length_ratio=0.1)
+
+        var_name = numerical_data.columns[i]
+
+        # Se la variabile è TSS, PHB/V o N, salviamo la punta
+        if var_name in special_vars:
+            special_tips.append({
+                'Variable': var_name,
+                'ArrowTip_X': arrow_tip[0],
+                'ArrowTip_Y': arrow_tip[1],
+                'ArrowTip_Z': arrow_tip[2]
+            })
+
+        # Gestione posizione dell'etichetta
+        if var_name in manual_positions:
+            # Se c'è una posizione manuale, usiamola
+            final_pos = manual_positions[var_name]
+        else:
+            # Altrimenti offset + avoid_label_overlap
+            candidate_pos = (
+                arrow_tip[0] * 1.10,
+                arrow_tip[1] * 1.10,
+                arrow_tip[2] * 1.10
+            )
+
+            final_pos = avoid_label_overlap(
+                label_positions,
+                candidate_pos,
+                threshold=0.4,
+                step=0.2,
+                max_iter=50
+            )
+
+        ax2.text(
+            final_pos[0],
+            final_pos[1],
+            final_pos[2],
+            var_name,
+            color='k',
+            fontsize=11  # Font size etichette variabili
+        )
+
+    # Stampa la tabella con i tip di TSS, PHB/V, N (se presenti)
+    if special_tips:
+        special_tips_df = pd.DataFrame(special_tips)
+        print("\n=== Arrow Tips for TSS, PHB/V, N ===")
+        print(special_tips_df.to_string(index=False))
+
+    # Aggiorna label degli assi con varianza spiegata (fontsize=12)
+    explained_variance = pca.explained_variance_ratio_
+    ax2.set_xlabel(rf'PC1 ({explained_variance[0]*100:.2f}%)', fontsize=12)
+    ax2.set_ylabel(rf'PC2 ({explained_variance[1]*100:.2f}%)', fontsize=12)
+    ax2.set_zlabel(rf'PC3 ({explained_variance[2]*100:.2f}%)', fontsize=12)
+
+    # Tick per PCA 3D
+    ax2.tick_params(axis='both', which='major', labelsize=11)
+
+    plt.subplots_adjust(left=0.05, right=0.95, bottom=0.1, top=0.9)
+    plt.tight_layout()
+    plt.show()
+
+# Esempio Colab
+uploaded = files.upload()
+file_path = list(uploaded.keys())[0]
+analyze_and_plot(file_path)
